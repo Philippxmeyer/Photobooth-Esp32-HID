@@ -12,7 +12,8 @@ Dieses Projekt ersetzt eine direkte GPIO-Button-/Relais-Anbindung von Photobooth
 
 - **Buttons:** Senden Tastendrücke an Photobooth, z. B. `t` für Bildaufnahme.
 - **Rückkanal:** Der Raspberry Pi setzt den Scroll-Lock-LED-Status der HID-Tastatur.
-- **Relais:** Der ESP32-S3 liest den Scroll-Lock-Status und schaltet damit ein Relais oder eine Statuslampe.
+- **Ausgang:** Der ESP32-S3 liest den Scroll-Lock-Status und schaltet damit wahlweise ein Relais oder einen PWM-gesteuerten MOSFET.
+- **Poti:** Im MOSFET-Modus wird der PWM-Duty-Cycle über ein Potentiometer vorgegeben.
 - **Vorteil:** Kein Photobooth-GPIO-Support und kein Remote-Buzzer-Server notwendig.
 
 ## Funktionsprinzip
@@ -24,18 +25,18 @@ flowchart TD
     C --> D[Photobooth startet Bildaufnahme]
     D --> E[Script vor Bildaufnahme: Scroll Lock ON]
     E --> F[ESP32-S3 empfängt HID-LED-Status]
-    F --> G[Relais an]
+    F --> G[Ausgang an: Relais oder MOSFET-PWM]
     G --> H[Script nach Bildaufnahme: Scroll Lock OFF]
     H --> I[ESP32-S3 empfängt HID-LED-Status]
-    I --> J[Relais aus]
+    I --> J[Ausgang aus]
 ```
 
 Als Textvariante:
 
 ```text
 Button drücken -> ESP32-S3 sendet Taste -> Photobooth reagiert
-Photobooth vor Aufnahme -> Scroll Lock ON  -> ESP32-S3 schaltet Relais ein
-Photobooth nach Aufnahme -> Scroll Lock OFF -> ESP32-S3 schaltet Relais aus
+Photobooth vor Aufnahme -> Scroll Lock ON  -> ESP32-S3 schaltet Ausgang ein
+Photobooth nach Aufnahme -> Scroll Lock OFF -> ESP32-S3 schaltet Ausgang aus
 ```
 
 ## Hardware
@@ -60,7 +61,8 @@ Buttons werden jeweils zwischen GPIO und GND angeschlossen. Im Sketch sind inter
 | Drucken | 6 | `p` | 80 |
 | Video | 7 | `v` | 86 |
 | Custom / frei | 15 | `x` | 88 |
-| Relais | 16 | Scroll Lock | - |
+| Relais oder MOSFET-Gate | 16 | Scroll Lock | - |
+| Poti-Schleifer | 1 | PWM Duty-Cycle | - |
 
 Button-Verdrahtung:
 
@@ -68,13 +70,39 @@ Button-Verdrahtung:
 GPIO ---- Button ---- GND
 ```
 
-Relais-Konfiguration im Sketch:
+Ausgangs-Konfiguration im Sketch:
+
+```cpp
+const OutputMode OUTPUT_MODE = OUTPUT_MODE_RELAY;
+```
+
+Für ein klassisches Relais bleibt `OUTPUT_MODE_RELAY` aktiv. Für einen MOSFET wird auf `OUTPUT_MODE_MOSFET` umgestellt.
+
+Relais-Polarität im Sketch:
 
 ```cpp
 const bool RELAY_ACTIVE_LOW = true;
 ```
 
-Bei einem Active-High-Relaismodul muss der Wert auf `false` geändert werden.
+Bei einem Active-High-Relaismodul muss der Wert auf `false` geändert werden. Die Relais-Polarität wird nur im Relais-Modus verwendet.
+
+MOSFET-/Poti-Konfiguration im Sketch:
+
+```cpp
+const uint8_t POTI_PIN = 1;
+const uint32_t MOSFET_PWM_FREQUENCY_HZ = 1000;
+const uint8_t MOSFET_PWM_RESOLUTION_BITS = 8;
+```
+
+Im MOSFET-Modus liegt bei Scroll Lock OFF ein PWM-Duty-Cycle von 0 % an. Bei Scroll Lock ON wird der Duty-Cycle laufend aus dem Poti-Wert gelesen. Das MOSFET-Gate wird aktiv HIGH angesteuert.
+
+Poti-Verdrahtung:
+
+```text
+3V3 ---- Poti ---- GND
+          |
+          +---- GPIO 1
+```
 
 ## Sicherheit bei Netzspannung
 
@@ -184,7 +212,7 @@ sleep 2
 sudo /usr/local/bin/scrolllock-relay off
 ```
 
-Das Relais sollte einschalten und danach wieder ausschalten.
+Das Relais sollte einschalten und danach wieder ausschalten. Im MOSFET-Modus sollte der PWM-Ausgang einschalten; die Stärke wird über das Poti eingestellt.
 
 ## Ausführung durch Photobooth erlauben
 
@@ -208,7 +236,7 @@ sleep 2
 sudo -u www-data sudo /usr/local/bin/scrolllock-relay off
 ```
 
-Wenn das Relais klickt, kann Photobooth das Script verwenden.
+Wenn das Relais klickt oder der MOSFET-Ausgang reagiert, kann Photobooth das Script verwenden.
 
 ## Photobooth konfigurieren
 
@@ -219,7 +247,7 @@ Im Photobooth-Adminpanel unter den Befehlen:
 | Script / Befehl vor Bildaufnahme | `sudo /usr/local/bin/scrolllock-relay on` |
 | Script / Befehl nach Bildaufnahme | `sudo /usr/local/bin/scrolllock-relay off` |
 
-Damit wird das Relais direkt vor der eigentlichen Aufnahme eingeschaltet und nach der Aufnahme wieder ausgeschaltet.
+Damit wird der konfigurierte Ausgang direkt vor der eigentlichen Aufnahme eingeschaltet und nach der Aufnahme wieder ausgeschaltet.
 
 ## Debugging
 
