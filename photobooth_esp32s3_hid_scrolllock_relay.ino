@@ -4,14 +4,17 @@
   Funktion:
   - ESP32-S3 meldet sich per USB als HID-Tastatur.
   - 5 Taster senden Tastendrücke an Photobooth.
-  - Der Raspberry Pi kann per Scroll-Lock-LED-Status ein Relais schalten.
-  - Scroll Lock ON  -> Relais an
-  - Scroll Lock OFF -> Relais aus
+  - Der Raspberry Pi kann per Scroll-Lock-LED-Status einen Ausgang schalten.
+  - Scroll Lock ON  -> Ausgang an
+  - Scroll Lock OFF -> Ausgang aus
+  - Der Ausgang kann als Relais oder als PWM-gesteuerter MOSFET betrieben werden.
+  - Im MOSFET-Modus steuert ein Potentiometer den PWM-Duty-Cycle.
 
   Hardware:
   - ESP32-S3 DevKit mit nativem USB
   - Buttons jeweils zwischen GPIO und GND
-  - Relaismodul an GPIO 16
+  - Relaismodul oder MOSFET-Gate an GPIO 16
+  - Potentiometer-Schleifer für MOSFET-PWM an GPIO 1 / ADC1_CH0
   - Viele Relaismodule sind active LOW.
 
   Arduino IDE:
@@ -55,15 +58,32 @@ const char BUTTON_KEYS[] = {
 
 const uint8_t BUTTON_COUNT = sizeof(BUTTON_PINS) / sizeof(BUTTON_PINS[0]);
 
-// Relais-Ausgang.
-// Scroll Lock ON  -> Relais an
-// Scroll Lock OFF -> Relais aus
-const uint8_t RELAY_PIN = 16;
+// Schaltausgang.
+// Scroll Lock ON  -> Ausgang an
+// Scroll Lock OFF -> Ausgang aus
+const uint8_t OUTPUT_PIN = 16;
+
+// Betriebsart des Ausgangs:
+// OUTPUT_MODE_RELAY  = klassisches digitales Relais
+// OUTPUT_MODE_MOSFET = MOSFET per PWM, Duty-Cycle über Potentiometer
+enum OutputMode {
+  OUTPUT_MODE_RELAY,
+  OUTPUT_MODE_MOSFET
+};
+
+const OutputMode OUTPUT_MODE = OUTPUT_MODE_RELAY;
 
 // Viele Arduino-Relaismodule sind active LOW:
 // LOW  = Relais an
 // HIGH = Relais aus
 const bool RELAY_ACTIVE_LOW = true;
+
+// MOSFET-PWM-Konfiguration.
+// Das MOSFET-Gate wird aktiv HIGH angesteuert.
+const uint8_t POTI_PIN = 1;
+const uint32_t MOSFET_PWM_FREQUENCY_HZ = 1000;
+const uint8_t MOSFET_PWM_RESOLUTION_BITS = 8;
+const uint16_t MOSFET_PWM_MAX_DUTY = (1 << MOSFET_PWM_RESOLUTION_BITS) - 1;
 
 // Optionaler Debug-LED-Pin.
 // 255 bedeutet: keine Debug-LED verwenden.
@@ -83,16 +103,37 @@ struct ButtonState {
 };
 
 ButtonState buttons[BUTTON_COUNT];
+bool outputEnabled = false;
 
 // ------------------------------------------------------------
 // Hilfsfunktionen
 // ------------------------------------------------------------
 
-void setRelay(bool on) {
-  if (RELAY_ACTIVE_LOW) {
-    digitalWrite(RELAY_PIN, on ? LOW : HIGH);
+uint16_t readMosfetDutyCycle() {
+  uint16_t potiValue = analogRead(POTI_PIN);
+
+  return map(potiValue, 0, 4095, 0, MOSFET_PWM_MAX_DUTY);
+}
+
+void writeMosfetPwm(uint16_t dutyCycle) {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(OUTPUT_PIN, dutyCycle);
+#else
+  ledcWrite(0, dutyCycle);
+#endif
+}
+
+void setOutput(bool on) {
+  outputEnabled = on;
+
+  if (OUTPUT_MODE == OUTPUT_MODE_RELAY) {
+    if (RELAY_ACTIVE_LOW) {
+      digitalWrite(OUTPUT_PIN, on ? LOW : HIGH);
+    } else {
+      digitalWrite(OUTPUT_PIN, on ? HIGH : LOW);
+    }
   } else {
-    digitalWrite(RELAY_PIN, on ? HIGH : LOW);
+    writeMosfetPwm(on ? readMosfetDutyCycle() : 0);
   }
 
   if (DEBUG_LED_PIN != 255) {
@@ -122,8 +163,8 @@ void handleButtonPress(uint8_t index) {
 // Num Lock, Caps Lock, Scroll Lock.
 //
 // Wir verwenden Scroll Lock als Rückkanal:
-// Scroll Lock ON  -> Relais an
-// Scroll Lock OFF -> Relais aus
+// Scroll Lock ON  -> Ausgang an
+// Scroll Lock OFF -> Ausgang aus
 
 void keyboardLedEventCallback(
   void *arg,
@@ -144,7 +185,7 @@ void keyboardLedEventCallback(
 
   bool scrollLockOn = data->scrolllock;
 
-  setRelay(scrollLockOn);
+  setOutput(scrollLockOn);
 }
 
 // ------------------------------------------------------------
@@ -152,9 +193,21 @@ void keyboardLedEventCallback(
 // ------------------------------------------------------------
 
 void setup() {
-  // Relais sofort sicher ausschalten.
-  pinMode(RELAY_PIN, OUTPUT);
-  setRelay(false);
+  // Ausgang sofort sicher ausschalten.
+  pinMode(OUTPUT_PIN, OUTPUT);
+
+  if (OUTPUT_MODE == OUTPUT_MODE_MOSFET) {
+    pinMode(POTI_PIN, INPUT);
+    analogReadResolution(12);
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcAttach(OUTPUT_PIN, MOSFET_PWM_FREQUENCY_HZ, MOSFET_PWM_RESOLUTION_BITS);
+#else
+    ledcSetup(0, MOSFET_PWM_FREQUENCY_HZ, MOSFET_PWM_RESOLUTION_BITS);
+    ledcAttachPin(OUTPUT_PIN, 0);
+#endif
+  }
+
+  setOutput(false);
 
   if (DEBUG_LED_PIN != 255) {
     pinMode(DEBUG_LED_PIN, OUTPUT);
@@ -185,6 +238,10 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+
+  if (OUTPUT_MODE == OUTPUT_MODE_MOSFET) {
+    writeMosfetPwm(outputEnabled ? readMosfetDutyCycle() : 0);
+  }
 
   for (uint8_t i = 0; i < BUTTON_COUNT; i++) {
     bool reading = digitalRead(BUTTON_PINS[i]);
