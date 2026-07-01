@@ -8,7 +8,10 @@
   - Scroll Lock ON  -> Ausgang an
   - Scroll Lock OFF -> Ausgang aus
   - Der Ausgang kann als Relais oder als PWM-gesteuerter MOSFET betrieben werden.
-  - Im MOSFET-Modus steuert ein Potentiometer den PWM-Duty-Cycle.
+  - Im MOSFET-Modus kann der PWM-Duty-Cycle per Potentiometer oder über
+    einen gespeicherten Festwert vorgegeben werden.
+  - Der Festwert kann per serieller Schnittstelle gesetzt und im Flash
+    dauerhaft gespeichert werden.
 
   Hardware:
   - ESP32-S3 DevKit mit nativem USB
@@ -28,8 +31,10 @@
 #include <Arduino.h>
 #include "USB.h"
 #include "USBHIDKeyboard.h"
+#include <Preferences.h>
 
 USBHIDKeyboard Keyboard;
+Preferences preferences;
 
 // ------------------------------------------------------------
 // Pinbelegung
@@ -85,6 +90,26 @@ const uint32_t MOSFET_PWM_FREQUENCY_HZ = 1000;
 const uint8_t MOSFET_PWM_RESOLUTION_BITS = 8;
 const uint16_t MOSFET_PWM_MAX_DUTY = (1 << MOSFET_PWM_RESOLUTION_BITS) - 1;
 
+// Duty-Cycle-Steuerung im MOSFET-Modus.
+// true  = Duty-Cycle laufend vom Potentiometer lesen
+// false = gespeicherten Festwert verwenden
+const bool MOSFET_USE_POTI_DUTY_CYCLE = false;
+
+// Fest programmierter Startwert, falls noch kein Wert gespeichert wurde.
+// Der Wert liegt im Bereich 0..MOSFET_PWM_MAX_DUTY.
+const uint16_t MOSFET_DEFAULT_FIXED_DUTY = 128;
+
+// Einfache serielle Befehle bei 115200 Baud:
+//   duty?       -> aktuellen Festwert anzeigen
+//   duty 128    -> Festwert 0..255 speichern
+//   duty 50%    -> Festwert als Prozentwert speichern
+const uint32_t SERIAL_BAUD_RATE = 115200;
+const char *PREFERENCES_NAMESPACE = "mosfet";
+const char *PREFERENCES_DUTY_KEY = "duty";
+
+uint16_t fixedMosfetDutyCycle = MOSFET_DEFAULT_FIXED_DUTY;
+String serialCommandBuffer;
+
 // Optionaler Debug-LED-Pin.
 // 255 bedeutet: keine Debug-LED verwenden.
 const uint8_t DEBUG_LED_PIN = 255;
@@ -105,14 +130,126 @@ struct ButtonState {
 ButtonState buttons[BUTTON_COUNT];
 bool outputEnabled = false;
 
+void writeMosfetPwm(uint16_t dutyCycle);
+
 // ------------------------------------------------------------
 // Hilfsfunktionen
 // ------------------------------------------------------------
 
-uint16_t readMosfetDutyCycle() {
+uint16_t constrainMosfetDutyCycle(uint16_t dutyCycle) {
+  return dutyCycle > MOSFET_PWM_MAX_DUTY ? MOSFET_PWM_MAX_DUTY : dutyCycle;
+}
+
+uint16_t readPotiMosfetDutyCycle() {
   uint16_t potiValue = analogRead(POTI_PIN);
 
   return map(potiValue, 0, 4095, 0, MOSFET_PWM_MAX_DUTY);
+}
+
+uint16_t readMosfetDutyCycle() {
+  if (MOSFET_USE_POTI_DUTY_CYCLE) {
+    return readPotiMosfetDutyCycle();
+  }
+
+  return fixedMosfetDutyCycle;
+}
+
+void printMosfetDutyCycle() {
+  Serial.print(F("MOSFET fixed duty: "));
+  Serial.print(fixedMosfetDutyCycle);
+  Serial.print(F(" / "));
+  Serial.print(MOSFET_PWM_MAX_DUTY);
+  Serial.print(F(" ("));
+  Serial.print((fixedMosfetDutyCycle * 100UL) / MOSFET_PWM_MAX_DUTY);
+  Serial.println(F("%)"));
+}
+
+bool parseDutyCycleValue(String value, uint16_t &dutyCycle) {
+  value.trim();
+
+  if (value.length() == 0) {
+    return false;
+  }
+
+  bool isPercent = value.endsWith("%");
+  if (isPercent) {
+    value.remove(value.length() - 1);
+    value.trim();
+  }
+
+  for (uint16_t i = 0; i < value.length(); i++) {
+    if (!isDigit(value.charAt(i))) {
+      return false;
+    }
+  }
+
+  unsigned long parsedValue = value.toInt();
+
+  if (isPercent) {
+    if (parsedValue > 100) {
+      return false;
+    }
+
+    dutyCycle = (parsedValue * MOSFET_PWM_MAX_DUTY) / 100;
+    return true;
+  }
+
+  if (parsedValue > MOSFET_PWM_MAX_DUTY) {
+    return false;
+  }
+
+  dutyCycle = parsedValue;
+  return true;
+}
+
+void handleSerialCommand(String command) {
+  command.trim();
+
+  if (command.length() == 0) {
+    return;
+  }
+
+  command.toLowerCase();
+
+  if (command == "duty?" || command == "duty") {
+    printMosfetDutyCycle();
+    return;
+  }
+
+  if (command.startsWith("duty ")) {
+    uint16_t newDutyCycle = 0;
+
+    if (!parseDutyCycleValue(command.substring(5), newDutyCycle)) {
+      Serial.println(F("ERROR: use duty 0..255 or duty 0..100%"));
+      return;
+    }
+
+    fixedMosfetDutyCycle = constrainMosfetDutyCycle(newDutyCycle);
+    preferences.putUShort(PREFERENCES_DUTY_KEY, fixedMosfetDutyCycle);
+
+    if (OUTPUT_MODE == OUTPUT_MODE_MOSFET && outputEnabled) {
+      writeMosfetPwm(fixedMosfetDutyCycle);
+    }
+
+    Serial.println(F("OK: duty saved"));
+    printMosfetDutyCycle();
+    return;
+  }
+
+  Serial.println(F("ERROR: unknown command. Use duty? or duty <0..255|0..100%>"));
+}
+
+void handleSerialInput() {
+  while (Serial.available() > 0) {
+    char incomingChar = Serial.read();
+
+    if (incomingChar == '\r' || incomingChar == '\n') {
+      handleSerialCommand(serialCommandBuffer);
+      serialCommandBuffer = "";
+    } else if (serialCommandBuffer.length() < 64) {
+      serialCommandBuffer += incomingChar;
+    }
+  }
 }
 
 void writeMosfetPwm(uint16_t dutyCycle) {
@@ -196,9 +333,18 @@ void setup() {
   // Ausgang sofort sicher ausschalten.
   pinMode(OUTPUT_PIN, OUTPUT);
 
+  Serial.begin(SERIAL_BAUD_RATE);
+
+  preferences.begin(PREFERENCES_NAMESPACE, false);
+  fixedMosfetDutyCycle = constrainMosfetDutyCycle(
+    preferences.getUShort(PREFERENCES_DUTY_KEY, MOSFET_DEFAULT_FIXED_DUTY)
+  );
+
   if (OUTPUT_MODE == OUTPUT_MODE_MOSFET) {
-    pinMode(POTI_PIN, INPUT);
-    analogReadResolution(12);
+    if (MOSFET_USE_POTI_DUTY_CYCLE) {
+      pinMode(POTI_PIN, INPUT);
+      analogReadResolution(12);
+    }
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
     ledcAttach(OUTPUT_PIN, MOSFET_PWM_FREQUENCY_HZ, MOSFET_PWM_RESOLUTION_BITS);
 #else
@@ -238,6 +384,8 @@ void setup() {
 
 void loop() {
   unsigned long now = millis();
+
+  handleSerialInput();
 
   if (OUTPUT_MODE == OUTPUT_MODE_MOSFET) {
     writeMosfetPwm(outputEnabled ? readMosfetDutyCycle() : 0);
