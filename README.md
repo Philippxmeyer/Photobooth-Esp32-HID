@@ -13,7 +13,7 @@ Dieses Projekt ersetzt eine direkte GPIO-Button-/Relais-Anbindung von Photobooth
 - **Buttons:** Senden Tastendrücke an Photobooth, z. B. `t` für Bildaufnahme.
 - **Rückkanal:** Der Raspberry Pi setzt den Scroll-Lock-LED-Status der HID-Tastatur.
 - **Ausgang:** Der ESP32-S3 liest den Scroll-Lock-Status und schaltet damit wahlweise ein Relais oder einen PWM-gesteuerten MOSFET.
-- **Poti:** Im MOSFET-Modus wird der PWM-Duty-Cycle über ein Potentiometer vorgegeben.
+- **Duty Cycle:** Im MOSFET-Modus wird der PWM-Duty-Cycle wahlweise über ein Potentiometer oder über einen gespeicherten Festwert vorgegeben.
 - **Vorteil:** Kein Photobooth-GPIO-Support und kein Remote-Buzzer-Server notwendig.
 
 ## Funktionsprinzip
@@ -92,9 +92,15 @@ MOSFET-/Poti-Konfiguration im Sketch:
 const uint8_t POTI_PIN = 1;
 const uint32_t MOSFET_PWM_FREQUENCY_HZ = 1000;
 const uint8_t MOSFET_PWM_RESOLUTION_BITS = 8;
+const bool MOSFET_USE_POTI_DUTY_CYCLE = false;
+const uint16_t MOSFET_DEFAULT_FIXED_DUTY = 128;
 ```
 
-Im MOSFET-Modus liegt bei Scroll Lock OFF ein PWM-Duty-Cycle von 0 % an. Bei Scroll Lock ON wird der Duty-Cycle laufend aus dem Poti-Wert gelesen. Das MOSFET-Gate wird aktiv HIGH angesteuert.
+Im MOSFET-Modus liegt bei Scroll Lock OFF ein PWM-Duty-Cycle von 0 % an. Bei Scroll Lock ON wird der Duty-Cycle entweder laufend aus dem Poti-Wert gelesen oder aus einem gespeicherten Festwert gesetzt. Das MOSFET-Gate wird aktiv HIGH angesteuert.
+
+- `MOSFET_USE_POTI_DUTY_CYCLE = true`: Poti ist aktiv und bestimmt den Duty-Cycle.
+- `MOSFET_USE_POTI_DUTY_CYCLE = false`: Poti ist deaktiviert; der ESP32 nutzt den gespeicherten Festwert.
+- `MOSFET_DEFAULT_FIXED_DUTY` ist der fest programmierte Startwert, solange noch kein Wert gespeichert wurde. Bei 8 Bit PWM ist der gültige Bereich `0` bis `255`.
 
 Poti-Verdrahtung:
 
@@ -103,6 +109,36 @@ Poti-Verdrahtung:
           |
           +---- GPIO 1
 ```
+
+
+## MOSFET-Duty-Cycle per serieller Schnittstelle setzen
+
+Wenn `MOSFET_USE_POTI_DUTY_CYCLE` auf `false` steht, nutzt der ESP32-S3 den gespeicherten Festwert für den MOSFET-Duty-Cycle. Der Wert wird im nichtflüchtigen Speicher des ESP32 abgelegt und bleibt nach einem Neustart erhalten.
+
+Serielle Schnittstelle:
+
+```text
+115200 Baud
+Zeilenende: NL oder CR/NL
+```
+
+Einfache Befehle:
+
+| Befehl | Funktion |
+| --- | --- |
+| `duty?` | gespeicherten Festwert anzeigen |
+| `duty 128` | Festwert direkt als PWM-Wert speichern, bei 8 Bit gültig `0` bis `255` |
+| `duty 50%` | Festwert als Prozentwert speichern, gültig `0%` bis `100%` |
+
+Beispiele:
+
+```text
+duty?
+duty 180
+duty 70%
+```
+
+Nach einem gültigen `duty`-Befehl antwortet der ESP32 mit `OK: duty saved` und speichert den neuen Wert dauerhaft. Wenn der MOSFET-Ausgang gerade eingeschaltet ist, wird der neue Duty-Cycle sofort angewendet.
 
 ## Sicherheit bei Netzspannung
 
